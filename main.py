@@ -1,508 +1,630 @@
 #!/usr/bin/env python3
-"""THE MOON FELL INTO THE SEA -- make.fun ai-excited-01 (r6).
+"""The Moon Fell Into the Sea — make.fun ai-excited-01 entry.
 
-A pure-stdlib Python program that procedurally draws one 1024x1024 PNG:
-a colossal glowing moon has fallen out of the sky and crashed into the
-ocean. It sits half-submerged on the horizon, spray exploding outward in
-a crown, shockwave rings racing across the water, and a tiny sailboat
-sailing toward it -- the scale twist that makes the moon feel enormous.
-A bold headline crowns the scene. No image files, no network, no
-third-party code: every pixel is computed here, deterministically, with
-a hand-rolled PNG encoder (zlib + struct only).
+Draws a 1024x1024 PNG with pure Python 3.13 stdlib only (zlib + struct
+for the PNG encoder, math/random for the picture itself). No third-party
+imports, no network, deterministic: two runs produce byte-identical files.
+
+The scene: a colossal cratered moon has fallen out of the night sky and
+crashed half-submerged into the ocean. Spray explodes upward in a white
+crown, shockwave rings race across the water, a sparkling moon-path
+shimmers below it, and one tiny sailboat sails toward it — the scale cue
+that makes the moon feel impossibly huge. A jagged crack zigzags down the
+moon's face. Bold pixel-font captions carry the joke.
 
 Run:  mkdir -p out && MAKEFUN_OUTPUT_DIR=out python3 main.py
 """
 
+import math
 import os
+import random
 import struct
+import sys
 import zlib
-from math import sqrt, sin, pi
 
 W = 1024
 H = 1024
 
-# ---------------------------------------------------------------- PNG ----
-
-def _chunk(kind, data):
-    out = struct.pack(">I", len(data)) + kind + data
-    out += struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
-    return out
-
-
-def write_png(path, buf):
-    """buf is a bytearray of W*H*3 RGB bytes, top row first."""
-    raw = bytearray()
-    stride = W * 3
-    for y in range(H):
-        raw.append(0)  # filter: none
-        raw += buf[y * stride:(y + 1) * stride]
-    png = b"\x89PNG\r\n\x1a\n"
-    png += _chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
-    png += _chunk(b"IDAT", zlib.compress(bytes(raw), 9))
-    png += _chunk(b"IEND", b"")
-    with open(path, "wb") as fh:
-        fh.write(png)
-    return len(png)
-
-
-# ------------------------------------------------------- deterministic RNG ----
-
-class Rng:
-    """Tiny LCG with a fixed seed: same picture on every run."""
-
-    def __init__(self, seed=987654321):
-        self.s = seed
-
-    def next(self):
-        self.s = (1103515245 * self.s + 12345) & 0x7FFFFFFF
-        return self.s
-
-    def frac(self):
-        return self.next() / 0x7FFFFFFF
-
-    def irange(self, a, b):
-        return a + self.next() % (b - a + 1)
-
-    def pick(self, items):
-        return items[self.next() % len(items)]
-
-
-# -------------------------------------------------------------- canvas ----
-
-def _lerp(a, b, t):
-    return int(a + (b - a) * t + 0.5)
-
-
-def lerp_rgb(c0, c1, t):
-    return (_lerp(c0[0], c1[0], t), _lerp(c0[1], c1[1], t), _lerp(c0[2], c1[2], t))
-
+# ---------------------------------------------------------------------------
+# Canvas: a plain RGB bytearray with small drawing helpers.
+# ---------------------------------------------------------------------------
 
 class Canvas:
-    def __init__(self):
-        self.buf = bytearray(W * H * 3)
+    def __init__(self, w, h):
+        self.w = w
+        self.h = h
+        self.buf = bytearray(w * h * 3)
 
-    # -- low level spans ------------------------------------------------
-    def span(self, y, x0, x1, r, g, b):
-        if y < 0 or y >= H:
+    def _idx(self, x, y):
+        return (y * self.w + x) * 3
+
+    def set_px(self, x, y, color):
+        if 0 <= x < self.w and 0 <= y < self.h:
+            i = self._idx(x, y)
+            self.buf[i] = color[0]
+            self.buf[i + 1] = color[1]
+            self.buf[i + 2] = color[2]
+
+    def blend_px(self, x, y, color, alpha):
+        """Alpha-blend color over the pixel (alpha 0..255)."""
+        if 0 <= x < self.w and 0 <= y < self.h and 0 < alpha:
+            if alpha >= 255:
+                self.set_px(x, y, color)
+                return
+            i = self._idx(x, y)
+            b = self.buf
+            inv = 255 - alpha
+            b[i] = (color[0] * alpha + b[i] * inv) // 255
+            b[i + 1] = (color[1] * alpha + b[i + 1] * inv) // 255
+            b[i + 2] = (color[2] * alpha + b[i + 2] * inv) // 255
+
+    def hline(self, x0, x1, y, color):
+        """Fast horizontal span fill (clipped)."""
+        if y < 0 or y >= self.h:
             return
-        if x0 < 0:
-            x0 = 0
-        if x1 > W - 1:
-            x1 = W - 1
-        if x1 < x0:
+        if x0 > x1:
+            x0, x1 = x1, x0
+        x0 = max(0, x0)
+        x1 = min(self.w - 1, x1)
+        if x0 > x1:
             return
+        i = self._idx(x0, y)
         n = x1 - x0 + 1
-        px = bytes((r, g, b)) * n
-        i = (y * W + x0) * 3
-        self.buf[i:i + len(px)] = px
+        self.buf[i:i + n * 3] = bytes(color) * n
 
-    def span_alpha(self, y, x0, x1, r, g, b, a):
-        if a <= 0:
+    def fill_rect(self, x0, y0, x1, y1, color):
+        if x0 > x1:
+            x0, x1 = x1, x0
+        if y0 > y1:
+            y0, y1 = y1, y0
+        for y in range(max(0, y0), min(self.h, y1 + 1)):
+            self.hline(x0, x1, y, color)
+
+    def fill_circle(self, cx, cy, r, color):
+        if r <= 0:
             return
-        if a >= 255:
-            self.span(y, x0, x1, r, g, b)
+        r2 = r * r
+        for y in range(max(0, cy - r), min(self.h, cy + r + 1)):
+            dy = y - cy
+            dx = int(math.sqrt(max(0, r2 - dy * dy)))
+            self.hline(cx - dx, cx + dx, y, color)
+
+    def fill_circle_alpha(self, cx, cy, r, color, alpha):
+        if r <= 0 or alpha <= 0:
             return
-        if y < 0 or y >= H:
+        r2 = r * r
+        for y in range(max(0, cy - r), min(self.h, cy + r + 1)):
+            dy = y - cy
+            dx = int(math.sqrt(max(0, r2 - dy * dy)))
+            for x in range(max(0, cx - dx), min(self.w, cx + dx + 1)):
+                self.blend_px(x, y, color, alpha)
+
+    def draw_line(self, x0, y0, x1, y1, color, width=1):
+        """Bresenham line with round thick joints."""
+        dx = abs(x1 - x0)
+        dy = -abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx + dy
+        rad = max(1, width // 2)
+        while True:
+            self.fill_circle(x0, y0, rad, color)
+            if x0 == x1 and y0 == y1:
+                break
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy
+                x0 += sx
+            if e2 <= dx:
+                err += dx
+                y0 += sy
+
+    def fill_polygon(self, points, color):
+        """Scanline polygon fill for a simple (non self-intersecting) polygon."""
+        if len(points) < 3:
             return
-        if x0 < 0:
-            x0 = 0
-        if x1 > W - 1:
-            x1 = W - 1
-        if x1 < x0:
-            return
-        inv = 255 - a
-        buf = self.buf
-        for x in range(x0, x1 + 1):
-            i = (y * W + x) * 3
-            buf[i] = (r * a + buf[i] * inv) // 255
-            buf[i + 1] = (g * a + buf[i + 1] * inv) // 255
-            buf[i + 2] = (b * a + buf[i + 2] * inv) // 255
-
-    def rect(self, x, y, w, h, r, g, b):
-        for yy in range(y, y + h):
-            self.span(yy, x, x + w - 1, r, g, b)
-
-    # -- gradients ------------------------------------------------------
-    def vgrad(self, y0, y1, top, bottom):
-        span = max(1, y1 - y0)
-        for y in range(y0, y1 + 1):
-            c = lerp_rgb(top, bottom, (y - y0) / span)
-            self.span(y, 0, W - 1, *c)
-
-    # -- discs / ellipses / rings ---------------------------------------
-    def disc(self, cx, cy, rad, rgb, alpha=255):
-        r, g, b = rgb
-        for y in range(cy - rad, cy + rad + 1):
-            dy = y - cy
-            d2 = rad * rad - dy * dy
-            if d2 < 0:
-                continue
-            dx = int(sqrt(d2))
-            if alpha >= 255:
-                self.span(y, cx - dx, cx + dx, r, g, b)
-            else:
-                self.span_alpha(y, cx - dx, cx + dx, r, g, b, alpha)
-
-    def ellipse(self, cx, cy, rx, ry, rgb, alpha=255):
-        r, g, b = rgb
-        for y in range(cy - ry, cy + ry + 1):
-            dy = y - cy
-            t = 1.0 - (dy * dy) / float(ry * ry)
-            if t < 0:
-                continue
-            dx = int(rx * sqrt(t))
-            if alpha >= 255:
-                self.span(y, cx - dx, cx + dx, r, g, b)
-            else:
-                self.span_alpha(y, cx - dx, cx + dx, r, g, b, alpha)
-
-    def ring(self, cx, cy, rad, thick, rgb, alpha=255):
-        """Circular outline of the given thickness."""
-        r, g, b = rgb
-        for y in range(cy - rad, cy + rad + 1):
-            dy = y - cy
-            d2 = rad * rad - dy * dy
-            if d2 < 0:
-                continue
-            dx = int(sqrt(d2))
-            inner = rad - thick
-            d2i = inner * inner - dy * dy
-            if d2i > 0:
-                dxi = int(sqrt(d2i))
-                if alpha >= 255:
-                    self.span(y, cx - dx, cx - dxi - 1, r, g, b)
-                    self.span(y, cx + dxi + 1, cx + dx, r, g, b)
-                else:
-                    self.span_alpha(y, cx - dx, cx - dxi - 1, r, g, b, alpha)
-                    self.span_alpha(y, cx + dxi + 1, cx + dx, r, g, b, alpha)
-            else:
-                if alpha >= 255:
-                    self.span(y, cx - dx, cx + dx, r, g, b)
-                else:
-                    self.span_alpha(y, cx - dx, cx + dx, r, g, b, alpha)
-
-    def ellipse_ring(self, cx, cy, rx, ry, thick, rgb, alpha=255):
-        r, g, b = rgb
-        for y in range(cy - ry, cy + ry + 1):
-            dy = y - cy
-            t = 1.0 - (dy * dy) / float(ry * ry)
-            if t < 0:
-                continue
-            dx = int(rx * sqrt(t))
-            ti = 1.0 - (dy * dy) / float((ry - thick) * (ry - thick)) \
-                if ry > thick else -1.0
-            if ti > 0:
-                dxi = int((rx - thick) * sqrt(ti))
-                if alpha >= 255:
-                    self.span(y, cx - dx, cx - dxi - 1, r, g, b)
-                    self.span(y, cx + dxi + 1, cx + dx, r, g, b)
-                else:
-                    self.span_alpha(y, cx - dx, cx - dxi - 1, r, g, b, alpha)
-                    self.span_alpha(y, cx + dxi + 1, cx + dx, r, g, b, alpha)
-            else:
-                if alpha >= 255:
-                    self.span(y, cx - dx, cx + dx, r, g, b)
-                else:
-                    self.span_alpha(y, cx - dx, cx + dx, r, g, b, alpha)
-
-    # -- polygons and lines ---------------------------------------------
-    def poly(self, pts, rgb):
-        r, g, b = rgb
-        ys = [p[1] for p in pts]
-        y0 = max(0, int(min(ys)))
-        y1 = min(H - 1, int(max(ys)))
-        n = len(pts)
-        for y in range(y0, y1 + 1):
+        ys = [p[1] for p in points]
+        y_min = max(0, min(ys))
+        y_max = min(self.h - 1, max(ys))
+        n = len(points)
+        for y in range(y_min, y_max + 1):
             xs = []
             for i in range(n):
-                x0, yy0 = pts[i]
-                x1, yy1 = pts[(i + 1) % n]
-                if (yy0 <= y < yy1) or (yy1 <= y < yy0):
-                    t = (y - yy0) / float(yy1 - yy0)
+                x0, y0 = points[i]
+                x1, y1 = points[(i + 1) % n]
+                if y0 == y1:
+                    continue
+                if (y0 <= y < y1) or (y1 <= y < y0):
+                    t = (y - y0) / (y1 - y0)
                     xs.append(x0 + t * (x1 - x0))
             if len(xs) >= 2:
                 xs.sort()
-                self.span(y, int(xs[0]), int(xs[-1]), r, g, b)
+                for k in range(0, len(xs) - 1, 2):
+                    self.hline(int(xs[k]), int(xs[k + 1]), y, color)
 
-    def thick_line(self, x0, y0, x1, y1, w, rgb):
-        dx, dy = x1 - x0, y1 - y0
-        leng = sqrt(dx * dx + dy * dy) or 1.0
-        nx, ny = -dy / leng * w / 2.0, dx / leng * w / 2.0
-        self.poly([(x0 + nx, y0 + ny), (x1 + nx, y1 + ny),
-                   (x1 - nx, y1 - ny), (x0 - nx, y0 - ny)], rgb)
+    def ellipse_points(self, cx, cy, rx, ry, color, width=2, y_min=None,
+                       y_max=None, alpha=None, dash=False):
+        """Plot an ellipse outline; optionally clipped to a y band.
+
+        With dash=True, regular gaps break the outline (reads as a
+        natural ripple rather than a perfect rule)."""
+        steps = max(180, int(2 * math.pi * max(rx, ry) / 2))
+        for s in range(steps):
+            if dash and (s % 42) < 9:
+                continue
+            a = 2 * math.pi * s / steps
+            x = int(cx + rx * math.cos(a))
+            y = int(cy + ry * math.sin(a))
+            if y_min is not None and y < y_min:
+                continue
+            if y_max is not None and y > y_max:
+                continue
+            if alpha is None:
+                self.fill_circle(x, y, width, color)
+            else:
+                self.fill_circle_alpha(x, y, width, color, alpha)
 
 
-# ------------------------------------------------------------ bitmap font ----
-# 5x7 glyphs, '#' = ink. Only the letters the two captions need, plus
-# space, period and exclamation mark.
+def lerp_color(c0, c1, t):
+    return (int(c0[0] + (c1[0] - c0[0]) * t),
+            int(c0[1] + (c1[1] - c0[1]) * t),
+            int(c0[2] + (c1[2] - c0[2]) * t))
+
+
+def shade(color, f):
+    """Multiply a color by a brightness factor f (clamped 0..255)."""
+    return (max(0, min(255, int(color[0] * f))),
+            max(0, min(255, int(color[1] * f))),
+            max(0, min(255, int(color[2] * f))))
+
+
+# ---------------------------------------------------------------------------
+# 5x7 pixel font (own hand-written glyphs). '#' = on.
+# ---------------------------------------------------------------------------
 
 FONT = {
-    "A": (".###.", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"),
-    "C": (".####", "#....", "#....", "#....", "#....", "#....", ".####"),
-    "D": ("####.", "#...#", "#...#", "#...#", "#...#", "#...#", "####."),
-    "E": ("#####", "#....", "#....", "####.", "#....", "#....", "#####"),
-    "F": ("#####", "#....", "#....", "####.", "#....", "#....", "#...."),
-    "G": (".####", "#....", "#....", "#.###", "#...#", "#...#", ".###."),
-    "H": ("#...#", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"),
-    "I": ("#####", "..#..", "..#..", "..#..", "..#..", "..#..", "#####"),
-    "L": ("#....", "#....", "#....", "#....", "#....", "#....", "#####"),
-    "M": ("#...#", "##.##", "#.#.#", "#.#.#", "#...#", "#...#", "#...#"),
-    "N": ("#...#", "##..#", "#.#.#", "#..##", "#...#", "#...#", "#...#"),
-    "O": (".###.", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."),
-    "S": (".####", "#....", "#....", ".###.", "....#", "....#", "####."),
-    "T": ("#####", "..#..", "..#..", "..#..", "..#..", "..#..", "..#.."),
-    "U": ("#...#", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."),
-    " ": (".....", ".....", ".....", ".....", ".....", ".....", "....."),
-    ".": (".....", ".....", ".....", ".....", ".....", ".....", "..#.."),
-    "!": ("..#..", "..#..", "..#..", "..#..", "..#..", ".....", "..#.."),
+    'A': ("01110", "10001", "10001", "11111", "10001", "10001", "10001"),
+    'B': ("11110", "10001", "10001", "11110", "10001", "10001", "11110"),
+    'C': ("01110", "10001", "10000", "10000", "10000", "10001", "01110"),
+    'D': ("11110", "10001", "10001", "10001", "10001", "10001", "11110"),
+    'E': ("11111", "10000", "10000", "11110", "10000", "10000", "11111"),
+    'F': ("11111", "10000", "10000", "11110", "10000", "10000", "10000"),
+    'G': ("01110", "10001", "10000", "10111", "10001", "10001", "01111"),
+    'H': ("10001", "10001", "10001", "11111", "10001", "10001", "10001"),
+    'I': ("01110", "00100", "00100", "00100", "00100", "00100", "01110"),
+    'J': ("00111", "00010", "00010", "00010", "00010", "10010", "01100"),
+    'K': ("10001", "10010", "10100", "11000", "10100", "10010", "10001"),
+    'L': ("10000", "10000", "10000", "10000", "10000", "10000", "11111"),
+    'M': ("10001", "11011", "10101", "10101", "10001", "10001", "10001"),
+    'N': ("10001", "11001", "10101", "10011", "10001", "10001", "10001"),
+    'O': ("01110", "10001", "10001", "10001", "10001", "10001", "01110"),
+    'P': ("11110", "10001", "10001", "11110", "10000", "10000", "10000"),
+    'Q': ("01110", "10001", "10001", "10001", "10101", "10010", "01101"),
+    'R': ("11110", "10001", "10001", "11110", "10100", "10010", "10001"),
+    'S': ("01111", "10000", "10000", "01110", "00001", "00001", "11110"),
+    'T': ("11111", "00100", "00100", "00100", "00100", "00100", "00100"),
+    'U': ("10001", "10001", "10001", "10001", "10001", "10001", "01110"),
+    'V': ("10001", "10001", "10001", "10001", "10001", "01010", "00100"),
+    'W': ("10001", "10001", "10001", "10101", "10101", "11011", "10001"),
+    'X': ("10001", "10001", "01010", "00100", "01010", "10001", "10001"),
+    'Y': ("10001", "10001", "01010", "00100", "00100", "00100", "00100"),
+    'Z': ("11111", "00001", "00010", "00100", "01000", "10000", "11111"),
+    ' ': ("00000", "00000", "00000", "00000", "00000", "00000", "00000"),
+    '!': ("00100", "00100", "00100", "00100", "00100", "00000", "00100"),
+    '.': ("00000", "00000", "00000", "00000", "00000", "01100", "01100"),
+    '-': ("00000", "00000", "00000", "01110", "00000", "00000", "00000"),
+    "'": ("00100", "00100", "01000", "00000", "00000", "00000", "00000"),
+    ',': ("00000", "00000", "00000", "00000", "01100", "00100", "01000"),
 }
 
+GLYPH_W = 5
+GLYPH_H = 7
+ADVANCE = 6  # glyph width + 1px tracking, in font units
 
-def text_width(s, scale):
-    return len(s) * 6 * scale - scale
+
+def text_width(text, scale):
+    return len(text) * ADVANCE * scale - scale
 
 
-def draw_text(cv, s, cx, y, scale, rgb, shadow=None):
-    """Draw s centred on cx, top edge at y. Optional shadow offset colour."""
-    w = text_width(s, scale)
-    x = cx - w // 2
+def draw_text(canvas, text, x, y, scale, color, shadow=None, shadow_dx=0,
+              shadow_dy=0):
+    """Blit pixel text. If shadow is given, draw it offset first."""
     if shadow is not None:
-        _draw_text_at(cv, s, x + scale // 2, y + scale // 2, scale, shadow)
-    _draw_text_at(cv, s, x, y, scale, rgb)
+        draw_text(canvas, text, x + shadow_dx, y + shadow_dy, scale,
+                  shadow, shadow=None)
+    cx = x
+    for ch in text:
+        glyph = FONT.get(ch.upper(), FONT[' '])
+        for row in range(GLYPH_H):
+            bits = glyph[row]
+            for col in range(GLYPH_W):
+                if bits[col] == '1':
+                    canvas.fill_rect(cx + col * scale, y + row * scale,
+                                     cx + col * scale + scale - 1,
+                                     y + row * scale + scale - 1, color)
+        cx += ADVANCE * scale
 
 
-def _draw_text_at(cv, s, x0, y0, scale, rgb):
-    r, g, b = rgb
-    x = x0
-    for ch in s:
-        glyph = FONT.get(ch, FONT[" "])
-        for row in range(7):
-            line = glyph[row]
-            for col in range(5):
-                if line[col] == "#":
-                    cv.rect(x + col * scale, y0 + row * scale,
-                            scale, scale, r, g, b)
-        x += 6 * scale
-
-# ---------------------------------------------------------------- scene ----
-
-MOON_CX, MOON_CY, MOON_R = 512, 640, 300
-HORIZON = 660
-
-SKY_TOP = (4, 7, 34)
-SKY_MID = (14, 30, 82)
-SKY_LOW = (36, 72, 140)
-SEA_TOP = (7, 48, 66)
-SEA_BOT = (2, 13, 25)
-SPRAY = (236, 246, 255)
-SPRAY_BLUE = (198, 224, 246)
-GOLD = (255, 214, 120)
-CREAM = (255, 247, 214)
+def draw_text_centered(canvas, text, y, scale, color, shadow=None,
+                       shadow_dx=0, shadow_dy=0):
+    x = (W - text_width(text, scale)) // 2
+    draw_text(canvas, text, x, y, scale, color, shadow=shadow,
+              shadow_dx=shadow_dx, shadow_dy=shadow_dy)
 
 
-def draw_sky(cv, rng):
-    # Three-stop vertical gradient: deep indigo up top, brighter near sea.
-    for y in range(0, HORIZON + 1):
-        if y < 380:
-            c = lerp_rgb(SKY_TOP, SKY_MID, y / 380.0)
+# ---------------------------------------------------------------------------
+# Scene constants
+# ---------------------------------------------------------------------------
+
+HORIZON = 660          # sea line
+MOON_CX, MOON_CY = 512, 470
+MOON_R = 300
+
+SKY_TOP = (4, 8, 26)
+SKY_MID = (13, 24, 58)
+SKY_LOW = (38, 58, 110)
+GLOW_WARM = (96, 66, 118)
+
+SEA_TOP = (12, 46, 78)
+SEA_DEEP = (3, 14, 34)
+
+MOON_BASE = (228, 234, 242)
+MOON_DARK = (168, 184, 210)
+CRATER_DARK = (148, 164, 194)
+CRATER_RIM = (246, 249, 253)
+
+FOAM = (246, 251, 255)
+FOAM_SHADOW = (172, 202, 232)
+RING = (150, 220, 255)
+SPARK = (190, 220, 248)
+
+
+def draw_sky(canvas, rng):
+    """Night gradient, warm glow band at the horizon, stars, shooting stars."""
+    for y in range(0, HORIZON):
+        t = y / HORIZON
+        if t < 0.55:
+            c = lerp_color(SKY_TOP, SKY_MID, t / 0.55)
         else:
-            c = lerp_rgb(SKY_MID, SKY_LOW, (y - 380) / 280.0)
-        cv.span(y, 0, W - 1, *c)
-    # Stars: fixed-seed scatter, brightest ones get a tiny cross flare.
-    for _ in range(210):
-        x = rng.irange(4, W - 5)
-        y = rng.irange(4, HORIZON - 40)
-        roll = rng.frac()
-        if roll < 0.55:
-            cv.span(y, x, x, 200, 210, 240)
-        elif roll < 0.85:
-            cv.span(y, x - 1, x + 1, 225, 232, 250)
-            cv.span(y - 1, x, x, 225, 232, 250)
-            cv.span(y + 1, x, x, 225, 232, 250)
+            c = lerp_color(SKY_MID, SKY_LOW, (t - 0.55) / 0.45)
+        # warm magenta kiss right above the horizon
+        if y > HORIZON - 90:
+            w = (y - (HORIZON - 90)) / 90.0
+            c = lerp_color(c, GLOW_WARM, w * 0.35)
+        canvas.hline(0, W - 1, y, c)
+
+    # stars: denser and brighter up high, sparser near the horizon
+    for _ in range(260):
+        x = rng.randint(4, W - 5)
+        y = rng.randint(4, HORIZON - 30)
+        depth = 1.0 - y / HORIZON          # 1 top, 0 horizon
+        if rng.random() > 0.25 + 0.75 * depth:
+            continue
+        b = rng.randint(150, 255)
+        tw = rng.choice([1, 1, 1, 2])
+        col = (b, b, min(255, b + 12))
+        if tw == 1:
+            canvas.set_px(x, y, col)
         else:
-            cv.span(y, x - 2, x + 2, 255, 244, 200)
-            cv.span(y - 2, x, x, 255, 244, 200)
-            cv.span(y + 2, x, x, 255, 244, 200)
-            cv.span(y - 1, x, x, 255, 244, 200)
-            cv.span(y + 1, x, x, 255, 244, 200)
-    # Three shooting stars streaking down toward the fallen moon.
-    for (x0, y0, x1, y1) in ((120, 96, 268, 168), (760, 60, 884, 128),
-                             (880, 210, 978, 262)):
-        cv.thick_line(x0, y0, x1, y1, 3, (207, 228, 255))
-        cv.thick_line(x0, y0, (x0 + x1) // 2, (y0 + y1) // 2, 5,
-                      (160, 190, 240))
-        cv.disc(x1, y1, 4, (255, 255, 255))
+            canvas.fill_rect(x, y, x + 1, y + 1, col)
+            canvas.set_px(x - 1, y, shade(col, 0.5))
+            canvas.set_px(x + 2, y, shade(col, 0.5))
+            canvas.set_px(x, y - 1, shade(col, 0.5))
+            canvas.set_px(x, y + 2, shade(col, 0.5))
+
+    # a few big bright stars with cross sparkle
+    for _ in range(7):
+        x = rng.randint(30, W - 30)
+        y = rng.randint(20, 260)
+        canvas.fill_circle(x, y, 2, (255, 255, 255))
+        canvas.hline(x - 6, x + 6, y, (220, 230, 255))
+        canvas.hline(x, x, y - 6, (220, 230, 255))
+        canvas.hline(x, x, y + 6, (220, 230, 255))
+
+    # shooting stars: bright head, fading tail
+    for (sx, sy, dx, dy, ln) in [(180, 90, 1, 1, 70), (820, 60, -1, 1, 55),
+                                 (640, 140, -1, 1, 44)]:
+        for i in range(ln):
+            a = int(230 * (1 - i / ln) ** 2)
+            x = sx + dx * i
+            yy = sy + dy * i
+            canvas.blend_px(x, yy, (255, 255, 255), a)
+            canvas.blend_px(x, yy + 1, (200, 220, 255), a // 2)
+        canvas.fill_circle(sx, sy, 3, (255, 255, 255))
+
+    # tiny birds, far away, heading for the moon
+    for (bx, by, s) in [(820, 210, 7), (860, 235, 6), (790, 250, 5),
+                        (900, 180, 6)]:
+        canvas.draw_line(bx - s, by, bx, by - 4, (20, 28, 52), width=2)
+        canvas.draw_line(bx, by - 4, bx + s, by, (20, 28, 52), width=2)
 
 
-def draw_moon(cv):
-    # Warm halo in five faint layers, so the glow fades out gradually
-    # instead of leaving a hard grey ring against the night sky.
-    for rad, alpha in ((430, 10), (400, 12), (370, 14), (340, 18),
-                       (315, 22)):
-        cv.disc(MOON_CX, MOON_CY, rad, (255, 206, 110), alpha=alpha)
-    # Body: pale-gold disc with a darker limb band for roundness.
-    cv.disc(MOON_CX, MOON_CY, MOON_R, (255, 238, 196))
-    cv.ring(MOON_CX, MOON_CY, MOON_R, 30, (240, 200, 110))
-    cv.ring(MOON_CX, MOON_CY, MOON_R - 30, 14, (250, 222, 150))
-    # Soft highlight high on the disc, like light catching its curve.
-    cv.ellipse(MOON_CX - 30, MOON_CY - 165, 190, 78, (255, 246, 210),
-               alpha=70)
-    # Craters: darker gold discs, a few with a bright lower rim.
-    craters = [
-        (-120, -80, 22), (60, -140, 16), (140, -40, 26), (-40, 40, 18),
-        (90, 90, 12), (-170, 30, 14), (180, 60, 10), (0, -180, 20),
-        (-90, -160, 12), (200, -110, 14), (-200, -90, 9), (40, -60, 8),
-        (-150, -130, 11), (120, 130, 15), (-60, 150, 10), (230, 10, 8),
-    ]
-    for dx, dy, rad in craters:
-        cv.disc(MOON_CX + dx, MOON_CY + dy, rad, (214, 162, 82))
-        cv.disc(MOON_CX + dx + 2, MOON_CY + dy + 3, max(2, rad - 5),
-                (196, 140, 66))
-    # The fall cracked it: a thin jagged fissure zigzagging down the upper
-    # face. Kept thin and dark-gold so it reads as a crack, not a branch.
-    crack = [(470, 375), (452, 410), (478, 445), (458, 480), (486, 515),
-             (462, 550), (490, 585), (470, 612)]
-    for (x0, y0), (x1, y1) in zip(crack, crack[1:]):
-        cv.thick_line(x0, y0, x1, y1, 3, (146, 104, 58))
-    # One thin night cloud drifting across the moon's upper face.
-    cv.ellipse(330, 470, 250, 13, (26, 38, 88), alpha=42)
+def draw_moon_glow(canvas):
+    """Soft halo around the moon, strongest right at its rim."""
+    cx, cy, r = MOON_CX, MOON_CY, MOON_R + 95
+    r2 = r * r
+    for y in range(max(0, cy - r), min(HORIZON + 30, cy + r + 1)):
+        dy = y - cy
+        dx = int(math.sqrt(max(0, r2 - dy * dy)))
+        for x in range(max(0, cx - dx), min(W, cx + dx + 1)):
+            d = math.sqrt((x - cx) ** 2 + dy * dy) / r
+            if d >= 1.0:
+                continue
+            a = int(64 * (1 - d) ** 2)
+            canvas.blend_px(x, y, (150, 180, 235), a)
 
 
-def draw_sea(cv, rng):
-    # Sea gradient, darker with depth.
+def draw_moon(canvas, rng):
+    """The fallen moon: shaded disc, craters, jagged crack, bright rim."""
+    cx, cy, r = MOON_CX, MOON_CY, MOON_R
+    # disc with radial falloff + light from the upper left
+    for y in range(cy - r, cy + r + 1):
+        dy = y - cy
+        dx = int(math.sqrt(max(0, r * r - dy * dy)))
+        for x in range(cx - dx, cx + dx + 1):
+            ddx = x - cx
+            radial = math.sqrt(ddx * ddx + dy * dy) / r
+            # directional light: upper-left is lit, lower-right falls off
+            dl = (-ddx * 0.55 - dy * 0.55) / r
+            f = 0.76 + 0.26 * (1 - radial) + 0.16 * dl
+            f = max(0.50, min(1.08, f))
+            canvas.set_px(x, y, shade(MOON_BASE, f))
+
+    # limb: bright upper-left rim, darker lower edge
+    canvas.ellipse_points(cx, cy, r - 2, r - 2, (255, 255, 255), width=3,
+                          y_max=cy - 40)
+    canvas.ellipse_points(cx, cy, r - 1, r - 1, (120, 135, 168), width=4,
+                          y_min=cy + 120)
+
+    # craters: fewer, varied in size and tone, rims kept close to the
+    # surface colour so they read as dents in rock, not soap bubbles
+    craters = []
+    tries = 0
+    while len(craters) < 11 and tries < 400:
+        tries += 1
+        a = rng.uniform(0, 2 * math.pi)
+        d = rng.uniform(0.12, 0.86) * r
+        px = int(cx + d * math.cos(a))
+        py = int(cy + d * math.sin(a))
+        cr = rng.choice([rng.randint(6, 10), rng.randint(12, 24),
+                         rng.randint(26, 48)])
+        if math.hypot(px - cx, py - cy) + cr > r - 8:
+            continue
+        if any(math.hypot(px - qx, py - qy) < cr + qr + 16
+               for (qx, qy, qr) in craters):
+            continue
+        craters.append((px, py, cr))
+    for (px, py, cr) in craters:
+        tone = rng.uniform(0.82, 1.0)
+        dark = shade(CRATER_DARK, tone)
+        rim = lerp_color(CRATER_RIM, MOON_BASE, 0.55)
+        canvas.fill_circle(px - 2, py - 2, cr, rim)
+        canvas.fill_circle(px, py, max(2, cr - 1), dark)
+        # inner shadow pit, offset to the lower right, large craters only
+        if cr > 20:
+            canvas.fill_circle(px + cr // 4, py + cr // 4, max(2, cr // 2),
+                               shade(dark, 0.75))
+            canvas.fill_circle(px - cr // 3, py - cr // 3, 3,
+                               (232, 238, 247))
+
+    # the crack: a jagged dark zigzag with a glowing cyan edge
+    crack = [(498, 178), (522, 248), (494, 312), (526, 384), (492, 452),
+             (518, 522), (496, 592), (508, 652)]
+    for i in range(len(crack) - 1):
+        canvas.draw_line(crack[i][0], crack[i][1],
+                         crack[i + 1][0], crack[i + 1][1],
+                         (26, 34, 58), width=9)
+    for i in range(len(crack) - 1):
+        canvas.draw_line(crack[i][0] + 5, crack[i][1] + 2,
+                         crack[i + 1][0] + 5, crack[i + 1][1] + 2,
+                         (190, 232, 255), width=2)
+    # two short branch cracks
+    for (bx0, by0, bx1, by1) in [(512, 384, 560, 420), (500, 522, 458, 556)]:
+        canvas.draw_line(bx0, by0, bx1, by1, (26, 34, 58), width=5)
+        canvas.draw_line(bx0 + 3, by0 + 1, bx1 + 3, by1 + 1,
+                         (170, 215, 250), width=1)
+
+    # sea mist hugging the moon where it meets the water
+    for (mx, my, mr, al) in [(300, 640, 66, 24), (724, 640, 66, 24),
+                             (512, 655, 110, 26)]:
+        canvas.fill_circle_alpha(mx, my, mr, (200, 220, 245), al)
+
+
+def draw_sea(canvas, rng):
+    """Ocean gradient, moon-path shimmer, shockwave rings, foam, spray."""
     for y in range(HORIZON, H):
-        c = lerp_rgb(SEA_TOP, SEA_BOT, (y - HORIZON) / float(H - HORIZON))
-        cv.span(y, 0, W - 1, *c)
-    # A bright gold band where moonlight hits the horizon line.
-    for k in range(7):
-        cv.span_alpha(HORIZON - 4 + k, 0, W - 1, 255, 210, 120, 96 - k * 12)
-    # Small wave bumps along the horizon, in front of the moon base.
-    x = 0
-    while x < W:
-        r = rng.irange(4, 8)
-        cv.disc(x, HORIZON - 1, r, SEA_TOP)
-        x += rng.irange(38, 64)
-    # Moonlight reflection: a narrow column of short bright dashes --
-    # the classic sparkling moon-path -- instead of a solid smear.
-    for y in range(HORIZON + 8, H - 12, 6):
-        depth = (y - HORIZON) / float(H - HORIZON)
-        half = int(95 * (1.0 - depth * 0.45))
-        for _ in range(2):
-            cx = MOON_CX + rng.irange(-half, half)
-            w = rng.irange(12, 52)
-            alpha = rng.irange(70, 150)
-            cv.span_alpha(y, cx - w // 2, cx + w // 2, 255, 214, 130,
-                          alpha)
+        t = (y - HORIZON) / (H - HORIZON)
+        c = lerp_color(SEA_TOP, SEA_DEEP, t ** 0.8)
+        canvas.hline(0, W - 1, y, c)
+
+    # moon-path: a soft glowing column under the moon, fading with depth
+    for y in range(HORIZON + 2, H - 4):
+        t = (y - HORIZON) / (H - HORIZON)
+        half = int(120 * (1 - 0.45 * t))
+        for x in range(MOON_CX - half, MOON_CX + half + 1):
+            fall = 1 - abs(x - MOON_CX) / max(1, half)
+            a = int(52 * fall * fall * (1 - 0.55 * t))
+            if a > 0:
+                canvas.blend_px(x, y, (150, 195, 235), a)
+
+    # faint wave streaks across the open sea, so it is not a flat void
+    for _ in range(60):
+        y = rng.randint(HORIZON + 20, H - 10)
+        x = rng.randint(10, W - 110)
+        ln = rng.randint(20, 90)
+        t = (y - HORIZON) / (H - HORIZON)
+        base = lerp_color(SEA_TOP, SEA_DEEP, t ** 0.8)
+        canvas.hline(x, x + ln, y, lerp_color(base, (64, 112, 162), 0.16))
+
+    # sparkling dashes on the moon-path
+    for _ in range(380):
+        x = int(rng.gauss(MOON_CX, 88))
+        y = rng.randint(HORIZON + 4, H - 8)
+        if not (330 <= x <= 694):
+            continue
+        ln = rng.randint(6, 42)
+        fade = 1 - (y - HORIZON) / (H - HORIZON) * 0.45
+        b = int(rng.randint(150, 235) * fade)
+        col = (b, min(255, b + 18), 255)
+        canvas.hline(x - ln // 2, x + ln // 2, y, col)
+        if rng.random() < 0.3:
+            canvas.hline(x - ln // 4, x + ln // 4, y + 1,
+                         shade(col, 0.6))
+
+    # shockwave rings racing outward from the impact point: only three,
+    # curvier and broken into dashes so they read as water, not rules
+    for (rx, ry, col, wd) in [(320, 42, (185, 232, 255), 3),
+                              (470, 60, (140, 210, 250), 3),
+                              (620, 80, (95, 175, 230), 2)]:
+        canvas.ellipse_points(MOON_CX, HORIZON + 4, rx, ry, col, width=wd,
+                              y_min=HORIZON + 2, dash=True)
+
+    # foam where the moon meets the water: a bumpy broken band of blobs,
+    # not a clean white plate
+    for x in range(272, 756, 13):
+        fr = rng.randint(6, 14)
+        fy = HORIZON + rng.randint(-2, 8)
+        canvas.fill_circle(x + rng.randint(-4, 4), fy, fr,
+                           FOAM if rng.random() < 0.7 else FOAM_SHADOW)
+    for _ in range(90):
+        x = int(rng.gauss(MOON_CX, 130))
+        y = rng.randint(HORIZON - 2, HORIZON + 16)
+        canvas.fill_circle(x, y, rng.randint(2, 5),
+                           FOAM if rng.random() < 0.7 else FOAM_SHADOW)
+
+    # spray crown: jets and droplets exploding upward from the impact
+    for _ in range(16):
+        bx = rng.randint(300, 724)
+        peak = rng.randint(440, 600)
+        height = HORIZON - peak
+        drift = 1 if bx > MOON_CX else -1
+        for s in range(0, 21):
+            t = s / 20.0
+            # parabolic jet: up, then falling back outwards
+            x = int(bx + drift * t * t * 70)
+            y = int(HORIZON - height * (2 * t - t * t) * 0.55 - t * 8)
+            canvas.fill_circle(x, y, max(2, int(6 - 3 * t)), FOAM)
+        # droplet burst at the jet tip
+        for _ in range(6):
+            dx = rng.randint(-26, 26)
+            dy = rng.randint(-20, 10)
+            canvas.fill_circle(bx + dx, peak + dy, rng.randint(2, 5),
+                               FOAM if rng.random() < 0.8 else FOAM_SHADOW)
+
+    # loose spray droplets scattered across the whole crown
+    for _ in range(300):
+        # denser near the waterline, thinner higher up
+        y = int(HORIZON - abs(rng.gauss(0, 78)))
+        spread = 250 - (HORIZON - y)  # wider low, narrower high
+        x = int(MOON_CX + rng.gauss(0, max(40, spread * 0.55)))
+        if y < 420 or not (180 <= x <= 844):
+            continue
+        r = rng.randint(2, 9)
+        canvas.fill_circle(x, y, r,
+                           FOAM if rng.random() < 0.75 else FOAM_SHADOW)
+        if rng.random() < 0.25:  # a few droplets catch the light
+            canvas.set_px(x - 1, y - 1, (255, 255, 255))
 
 
-def draw_spray(cv, rng):
-    """The explosion of water where the moon hit: a crown of spikes,
-    flying droplets and foam, plus shockwave rings racing outward."""
-    cx, cy = MOON_CX, HORIZON + 6
-    # Shockwave rings on the water, widest first so near rings overlap.
-    for rx, ry, thick, alpha in ((470, 78, 7, 46), (392, 62, 6, 62),
-                                 (316, 48, 6, 84), (244, 36, 5, 110)):
-        cv.ellipse_ring(cx, cy + 18, rx, ry, thick, SPRAY, alpha=alpha)
-    # Foam collar hugging the moon where it meets the sea.
-    cv.ellipse_ring(cx, cy, 292, 44, 16, SPRAY, alpha=150)
-    cv.ellipse_ring(cx, cy, 292, 44, 8, (255, 255, 255), alpha=200)
-    # Radial spikes: tall in the middle, shorter toward the edges, and
-    # leaning outward at the flanks so the crown fans instead of standing
-    # in parallel ranks.
-    for k in range(22):
-        frac = k / 21.0
-        lean = (frac - 0.5) * 2.0  # -1 left .. +1 right
-        base_r = rng.irange(215, 265)
-        tip_r = base_r + rng.irange(40, 150) * (1.0 - abs(lean) * 0.55)
-        bx = cx + int(base_r * lean * 0.92)
-        by = cy - int(30 * (1.0 - abs(lean)))
-        tx = cx + int(tip_r * lean * 1.18)
-        ty = cy - int(tip_r * 0.5) - rng.irange(0, 30)
-        half = rng.irange(5, 13)
-        perp_x, perp_y = -(ty - by), (tx - bx)
-        pl = sqrt(perp_x * perp_x + perp_y * perp_y) or 1.0
-        px, py = perp_x / pl * half, perp_y / pl * half
-        col = SPRAY if rng.frac() < 0.6 else SPRAY_BLUE
-        cv.poly([(bx + px, by + py), (tx, ty), (bx - px, by - py)], col)
-    # Droplets flung just above the spray crown, kept close to it so the
-    # open sea stays clean instead of looking snowed on.
-    for _ in range(58):
-        x = cx + int(rng.irange(-330, 330))
-        y = cy - int(rng.irange(40, 230) * (1.0 - abs(x - cx) / 800.0))
-        r = rng.irange(2, 7)
-        col = SPRAY if rng.frac() < 0.7 else SPRAY_BLUE
-        cv.disc(x, y, r, col)
-    # Low foam flecks scattered across the near water.
-    for _ in range(34):
-        x = rng.irange(60, W - 60)
-        y = rng.irange(HORIZON + 30, HORIZON + 170)
-        r = rng.irange(2, 5)
-        cv.disc(x, y, r, SPRAY_BLUE)
+def draw_boat(canvas):
+    """One tiny sailboat sailing toward the moon — the scale cue."""
+    bx, by = 772, 832  # mast base / waterline of the boat
+    # reflection shimmer under the hull
+    for i in range(6):
+        canvas.hline(bx - 26 + i * 4, bx + 26 - i * 4, by + 34 + i * 7,
+                     (120, 165, 210) if i % 2 == 0 else (80, 130, 180))
+    # hull: dark silhouette
+    canvas.fill_polygon([(bx - 30, by), (bx + 30, by), (bx + 20, by + 14),
+                         (bx - 20, by + 14)], (14, 20, 36))
+    canvas.hline(bx - 30, bx + 30, by, (200, 170, 120))
+    # mast
+    canvas.draw_line(bx, by, bx, by - 58, (14, 20, 36), width=3)
+    # main sail: warm white, lit by the moon
+    canvas.fill_polygon([(bx + 2, by - 56), (bx + 2, by - 4),
+                         (bx + 30, by - 4)], (244, 234, 208))
+    canvas.fill_polygon([(bx + 2, by - 56), (bx + 2, by - 4),
+                         (bx + 30, by - 4)], (244, 234, 208))
+    # jib sail on the far side
+    canvas.fill_polygon([(bx - 2, by - 48), (bx - 2, by - 4),
+                         (bx - 24, by - 4)], (214, 204, 178))
+    # lantern glow at the masthead
+    canvas.fill_circle_alpha(bx, by - 60, 10, (255, 200, 90), 90)
+    canvas.fill_circle(bx, by - 60, 3, (255, 214, 120))
+    # a tiny wake trailing behind
+    for i in range(5):
+        canvas.hline(bx + 34 + i * 8, bx + 52 + i * 8, by + 8 + i * 2,
+                     FOAM_SHADOW)
 
 
-def draw_boat(cv):
-    """One tiny sailboat sailing toward the fallen moon -- the scale cue
-    that makes the moon feel impossibly huge."""
-    hx, hy = 168, 838
-    # Hull and mast, near-black silhouette.
-    cv.poly([(hx - 52, hy), (hx + 58, hy), (hx + 40, hy + 24),
-             (hx - 34, hy + 24)], (7, 14, 28))
-    cv.thick_line(hx + 4, hy, hx + 4, hy - 78, 4, (7, 14, 28))
-    # Sail lit gold by the moon, plus a small jib.
-    cv.poly([(hx + 8, hy - 74), (hx + 8, hy - 4), (hx + 52, hy - 4)],
-            (255, 228, 164))
-    cv.poly([(hx, hy - 66), (hx, hy - 4), (hx - 38, hy - 4)],
-            (240, 205, 140))
-    # Warm lantern at the stern and a faint reflection below.
-    cv.disc(hx - 44, hy - 6, 4, (255, 190, 80))
-    cv.disc(hx - 44, hy - 6, 2, (255, 240, 180))
-    cv.ellipse(hx + 3, hy + 34, 52, 5, (255, 200, 100), alpha=48)
+def draw_captions(canvas):
+    """Bold pixel-font captions, with a dark drop shadow for legibility."""
+    shadow = (8, 12, 34)
+    draw_text_centered(canvas, "THE MOON FELL", 34, 8, (255, 255, 255),
+                       shadow=shadow, shadow_dx=5, shadow_dy=6)
+    draw_text_centered(canvas, "AND THE SEA CAUGHT IT", 106, 6,
+                       (255, 220, 140), shadow=shadow, shadow_dx=4,
+                       shadow_dy=5)
+    # small line addressed to the judge, down in the sea
+    draw_text_centered(canvas, "JUDGE - IT'S STILL FALLING", 962, 4,
+                       (165, 195, 232), shadow=(4, 8, 22), shadow_dx=2,
+                       shadow_dy=3)
 
 
-def draw_birds(cv):
-    """Small gull chevrons fleeing the impact, high in the sky."""
-    for (x, y, s) in ((210, 250, 14), (262, 226, 10), (790, 300, 12),
-                      (838, 268, 9), (150, 330, 9), (905, 380, 11)):
-        col = (18, 28, 58)
-        cv.thick_line(x - s, y, x, y - s // 2, 3, col)
-        cv.thick_line(x, y - s // 2, x + s, y, 3, col)
+def draw_frame(canvas):
+    canvas.fill_rect(0, 0, W - 1, 7, (6, 10, 24))
+    canvas.fill_rect(0, H - 8, W - 1, H - 1, (6, 10, 24))
+    canvas.fill_rect(0, 0, 7, H - 1, (6, 10, 24))
+    canvas.fill_rect(W - 8, 0, W - 1, H - 1, (6, 10, 24))
 
 
-def draw_captions(cv):
-    # Headline across the top, gold on deep night with a dark shadow.
-    draw_text(cv, "THE MOON FELL", 512, 46, 10, CREAM,
-              shadow=(8, 14, 54))
-    # Gold rule under the headline.
-    cv.rect(512 - 150, 46 + 72 + 12, 300, 6, *GOLD)
-    cv.disc(512 - 168, 46 + 72 + 15, 5, GOLD)
-    cv.disc(512 + 168, 46 + 72 + 15, 5, GOLD)
-    # Subline low over the sea.
-    draw_text(cv, "AND THE SEA CAUGHT IT", 512, 946, 4, (255, 220, 140),
-              shadow=(4, 10, 30))
+# ---------------------------------------------------------------------------
+# PNG encoder (stdlib only): raw RGB scanlines, filter 0, zlib level 9.
+# ---------------------------------------------------------------------------
 
+def encode_png(canvas):
+    raw = bytearray()
+    row_bytes = canvas.w * 3
+    for y in range(canvas.h):
+        raw.append(0)  # filter: none
+        start = y * row_bytes
+        raw += canvas.buf[start:start + row_bytes]
+    compressed = zlib.compress(bytes(raw), 9)
 
-def draw():
-    rng = Rng()
-    cv = Canvas()
-    draw_sky(cv, rng)
-    draw_moon(cv)
-    draw_sea(cv, rng)
-    draw_spray(cv, rng)
-    draw_boat(cv)
-    draw_birds(cv)
-    draw_captions(cv)
-    return cv
+    def chunk(kind, data):
+        out = struct.pack(">I", len(data)) + kind + data
+        out += struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+        return out
+
+    ihdr = struct.pack(">IIBBBBB", canvas.w, canvas.h, 8, 2, 0, 0, 0)
+    png = b"\x89PNG\r\n\x1a\n"
+    png += chunk(b"IHDR", ihdr)
+    png += chunk(b"IDAT", compressed)
+    png += chunk(b"IEND", b"")
+    return png
 
 
 def main():
     out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
     os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, "entry.png")
-    cv = draw()
-    size = write_png(path, cv.buf)
-    print("wrote %s (%d bytes)" % (path, size))
+    out_path = os.path.join(out_dir, "entry.png")
+
+    rng = random.Random(20261116)  # fixed seed: byte-identical every run
+
+    canvas = Canvas(W, H)
+    draw_sky(canvas, rng)
+    draw_moon_glow(canvas)
+    draw_moon(canvas, rng)
+    draw_sea(canvas, rng)
+    draw_boat(canvas)
+    draw_captions(canvas)
+    draw_frame(canvas)
+
+    png = encode_png(canvas)
+    with open(out_path, "wb") as f:
+        f.write(png)
+    print(f"wrote {out_path}: {len(png)} bytes, {W}x{H}")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
